@@ -1,0 +1,43 @@
+{
+  "name": "coffer-cost-review",
+  "version": "0.1.0",
+  "description": "Claude Code skill that audits AI codebases for LLM cost-waste. Reads your code with semantic understanding (not regex) — knows when cache_control is applied at runtime, when agent loops are bounded externally, and when an f-string is actually static at init.",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "skill",
+    "llm",
+    "finops",
+    "openai",
+    "anthropic",
+    "cost",
+    "cost-review",
+    "cofferwise",
+    "ai-cost"
+  ],
+  "homepage": "https://cofferwise.com",
+  "bugs": "https://github.com/neal-c611/coffer-cost-review/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neal-c611/coffer-cost-review.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Neal",
+  "files": [
+    "skill",
+    "install.js",
+    "uninstall.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "coffer-cost-review": "./install.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js --silent || true",
+    "preuninstall": "node uninstall.js --silent || true"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
