@@ -1,6 +1,6 @@
 {
   "name": "coffer-cost-review",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Claude Code skill that audits AI codebases for LLM cost-waste. Reads your code with semantic understanding (not regex) — knows when cache_control is applied at runtime, when agent loops are bounded externally, and when an f-string is actually static at init.",
   "keywords": [
     "claude-code",

@@ -22,6 +22,29 @@ a different frame ("production-readiness review") if the user asks.
 Every finding has to answer "yes" to: **does fixing this reduce the bill the
 provider sends at month end?** If you can't say yes confidently, don't flag.
 
+## Target mode: library vs application
+
+Before scanning, decide what kind of code this is:
+
+- **Application** — runs in production, has known volume, hardcoded model /
+  prompt choices represent live decisions. Severity is unmodified.
+- **Library / framework** — distributed for others to compose into their
+  own apps. `default_factory=lambda: LLM("gpt-4o")` and similar Field
+  defaults are starting points users almost always override. Severity for
+  defaults drops by one (HIGH → MED, MED → LOW), and the suggested fix
+  should propose an API surface (a hook, a config flag, a smaller-default
+  override) rather than a unilateral edit. **System prompt templates that
+  ship with the library** are still legitimate findings — those are
+  rarely overridden.
+- **CLI / TTY tool** — bills against the user's own provider key. Cost
+  hygiene matters but client-disconnect signals are different: a
+  `KeyboardInterrupt` handler that breaks the generator is the
+  equivalent of `request.is_disconnected()`. Treat it as a valid abort
+  for Pattern K.
+
+When unsure, ask the user once: "Is this a production app, a published
+library, or a CLI tool?" — the answer changes how strictly to grade.
+
 ## Step 1 — Determine scope
 
 If the user named a path, use it. Otherwise default to scanning these in
@@ -98,9 +121,17 @@ and no `cache_control` exists anywhere in the call path.
 3. Check if `messages` is rebuilt from a database / session store on each
    request (common in chat APIs). If so, the in-memory list is per-request
    and bounded by the request itself. **Skip.**
+4. **Summarization / sliding window over tokens** is also a valid bound —
+   not only iteration counts. Look for a `Summarizer`, `summarize_history`,
+   `compact_messages`, `ChatSummary`, Mem0-style memory, or an explicit
+   `if token_count > threshold: messages = summarize(messages)` BEFORE
+   the call. Aider's `Summarizer.too_big(done_messages)` followed by
+   `summarizer.summarize(...)` at `base_coder.py:1003-1034` is the
+   canonical example. **Skip.**
 
 **Flag if**: the same list survives across requests AND no external cap
-exists. Typical example: long-lived agent state in a daemon process.
+exists (iteration, token-budget, or summarization). Typical example:
+long-lived agent state in a daemon process with no compaction.
 
 ### Pattern C — dynamic content before static (cache break)
 
@@ -119,23 +150,42 @@ exists. Typical example: long-lived agent state in a daemon process.
    parameter (browser navigation, function arg, search query), it's NOT
    a system prompt — caching is irrelevant. **Skip.** (stagehand_tool's
    `instruction = f"Navigate to {url}"` is this pattern.)
-3. If the interpolated value is per-user / per-request (`user_id`,
-   `request_id`, a session-specific document), the cache break is real.
+3. **Static-per-session is also fine.** When interpolated values are
+   set once at coder / session / agent init (e.g. OS platform, language
+   from config, fence characters chosen during setup) and remain stable
+   for the lifetime of the session, prefix caching still hits within the
+   session. Aider's `fmt_system_prompt` formatting `{fence}`,
+   `{platform}`, `{language}` at `base_coder.py:1174-1224` is this
+   pattern. **Skip.**
+4. If the interpolated value is per-user / per-request (`user_id`,
+   `request_id`, a session-specific document, a current-time stamp), the
+   cache break is real.
 
 **Flag if**: the interpolation truly varies per request AND the result is
 sent as a system message (not a user message — user messages are
 inherently dynamic).
 
-### Pattern D — retry loop without backoff
+### Pattern D — retry loop without backoff (around an LLM call)
 
 **Surface signal**: `for attempt in range(N)` or `while retries` containing
-an LLM call with no `backoff.on_exception`, `tenacity`, `time.sleep`,
+a call with no `backoff.on_exception`, `tenacity`, `time.sleep`,
 `asyncio.sleep`, or `2 ** attempt` pattern.
 
-This is rarely a false positive — the cost angle is real (a rate-limit
-storm causes N retries, each re-bills the same input tokens).
+**Confirm first**: the body of the retry loop must wrap an actual LLM call
+(`chat.completions.create`, `messages.create`, `responses.create`, etc.)
+or a function whose only purpose is to wrap one. Retries around HTTP auth
+challenges, MCP tool execution, database writes, file I/O, vector-store
+operations, etc. don't change the LLM bill — they may still be production
+bugs, but they belong in a reliability review. **Skip** if the retried
+operation isn't an LLM call.
 
-**Always flag** as HIGH severity.
+**Do not flag if**: the body already has exponential backoff with a
+ceiling (`retry_delay *= 2; if retry_delay > MAX: break`), or uses
+`tenacity` / `backoff` / `litellm`'s `num_retries` parameter.
+
+**Flag (HIGH) if**: the retry wraps an LLM call AND there is no backoff /
+no ceiling. Cost angle: a rate-limit storm or network blip re-sends the
+same input tokens N times — each one billed.
 
 ### Pattern E — agent loop without max iteration
 
@@ -189,14 +239,61 @@ without a visible rate limit decorator or user_id binding.
 
 Flag — free / anonymous users burn your provider quota.
 
+### Pattern L — agent loop with quadratic input growth
+
+**Surface signal**: an agent / reflection loop where each iteration calls
+the LLM with **the full prior history** rebuilt from a memory store
+(`memory.steps`, `agent_state.messages`, `chat_history`). With `max_steps=N`,
+step N re-bills steps 1 through N-1 as input. Total input tokens grow as
+`O(N²)` per run.
+
+This is distinct from Pattern B (`unbounded_conversation_history`):
+
+- Pattern B is *cross-request* growth (the same list survives across
+  user requests).
+- Pattern L is *within a single run* — even bounded by `max_steps`, the
+  quadratic curve makes long agent runs surprisingly expensive.
+
+**Do not flag if**:
+
+1. The agent uses an explicit chain primitive that the provider deduplicates
+   server-side: OpenAI's Responses API `previous_response_id`, Anthropic
+   server-side conversation state, etc. **Skip.**
+2. Anthropic with `cache_control` applied to the rolling prefix — caching
+   makes the re-bill essentially free for cached portions. Verify the
+   prefix is stable across steps (only growing at the tail). **Skip.**
+3. `max_steps` is small (≤ 3-5) — the quadratic constant is too small to
+   matter. **Skip.**
+
+**Flag (MED) if**: history is rebuilt and resent each step, `max_steps` is
+≥ 10, and no caching primitive offsets the re-bill. Especially relevant for
+OpenAI auto-cache, which breaks when the prefix mutates per step. Suggested
+fix: switch to `previous_response_id` for OpenAI, or wrap the rolling
+prefix in `cache_control={"type": "ephemeral"}` for Anthropic.
+
 ### Pattern K — streaming without disconnect detection
 
-**Surface signal**: `stream=True` in an LLM call with no
-`request.is_disconnected()` check, no `AbortSignal`, no try/finally that
-closes the upstream stream when the client closes.
+**Surface signal**: `stream=True` in an LLM call with no client-disconnect
+check.
 
-Flag — the provider keeps generating (and billing) tokens that nobody
-receives.
+**Do not flag if** the abort path exists, even when it doesn't look like
+the web pattern:
+
+- Web server: `request.is_disconnected()` (FastAPI), `AbortSignal`
+  (Express / Hono), `res.on('close', ...)` (Node http), `request.on_disconnect`
+  (Sanic), etc. — all valid.
+- **CLI / TTY**: a `KeyboardInterrupt` handler that breaks the generator
+  is the equivalent of `is_disconnected()`. Aider's
+  `except KeyboardInterrupt: ...` at `base_coder.py:889, 1489, 1572, 1819`
+  is the canonical example. **Skip.**
+- **Library generator**: the function itself returns a generator and lets
+  the caller's iteration drive lifecycle. Python garbage-collects the
+  generator and closes the upstream when the consumer stops iterating —
+  library-level cost is fine; only the consuming app needs a check.
+
+**Flag if**: web/API context AND `stream=True` is reached AND no
+disconnect / abort signal is observed anywhere downstream of the call.
+The provider keeps generating (and billing) tokens that nobody receives.
 
 ## Step 4 — Output structured review
 
